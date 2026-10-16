@@ -29,6 +29,7 @@ ENGINES = {
     "dynamo-trt": "trtllm",
     "atom": "atom",
     "atom-disagg": "atom",
+    "infera-atom": "atom",
     "tilert": "tilert",
 }
 SGLANG_VARIABLES = (

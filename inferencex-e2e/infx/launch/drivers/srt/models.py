@@ -89,6 +89,8 @@ OVERRIDES: dict[str, tuple[Override, ...]] = {
     "mi355x-amds": (
         Override(Match(any_of("dsr1"), any_of("fp8"), any_of("sglang-disagg")), hub=True),
         Override(Match(any_of("qwen3.5"), any_of("fp4"), any_of("sglang-disagg")), hub=True),
+        # Infera registers the literal --model and clients send the Hub id.
+        Override(Match(frameworks=any_of("infera-atom")), hub=True),
     ),
 }
 
