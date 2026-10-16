@@ -29,6 +29,12 @@ Shared runtime assets stay under `configs/` beside the model directories; they a
 
 TileRT uses the pinned upstream srt-slurm submodule. Recipes select `roles.prefill.engine: vllm`, `roles.decode.engine: tilert`, and `frontend.type: tilert-router`.
 
+## Infera
+
+Infera uses the carried [`NNN-infera-frontend.patch`](../../../runners/srt-slurm/patches/NNN-infera-frontend.patch). Recipes select `engine: atom` and `frontend.type: infera`: srtctl starts etcd and the Infera router (`infera.server`) and runs each ATOM worker under `infera.engine.atom`. The image must already contain Infera; no setup script installs it. Workers register under their literal `--model` and clients send `MODEL`. Roles cannot set `served-model-name` because srtctl rejects it, so on a cluster that stages the checkpoint (`models.entries`) the point needs a `models.OVERRIDES` row with `hub=True` to keep `--model` the Hub id.
+
+The pinned srtctl rejects `frontend.type: infera`, so `infx generate` for these points needs a checkout whose `utils/srt-slurm` has the patches in [`runners/srt-slurm/patches/`](../../../runners/srt-slurm/patches) applied. The planner selects variants without srtctl and is unaffected.
+
 ## Schema 2 and master configuration
 
 Recipes use `schema: 2`, `engine`, and `roles`. Each worker role owns its node count, worker count, GPU allocation, environment, and engine arguments. `resources` retains GPU hardware facts. `placement` controls the frontend and benchmark location, `services` describes auxiliary processes, and `dynamo.source` selects the Dynamo package or source revision.

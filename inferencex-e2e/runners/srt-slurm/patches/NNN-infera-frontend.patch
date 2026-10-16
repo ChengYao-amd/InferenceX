@@ -1,0 +1,941 @@
+diff --git a/src/srtctl/backends/atom.py b/src/srtctl/backends/atom.py
+index edf9a9b..7d8a3fa 100644
+--- a/src/srtctl/backends/atom.py
++++ b/src/srtctl/backends/atom.py
+@@ -23,6 +23,11 @@ if TYPE_CHECKING:
+     from srtctl.core.schema import ProfilingConfig
+     from srtctl.core.topology import Endpoint, NodePortAllocator, Process
+ 
++# ATOM arguments srtctl derives from the allocation; a role cannot set them.
++MANAGED_ARGS = frozenset({"model", "host", "server-port", "tp", "tensor-parallel-size", "kv-transfer-config"})
++# ATOM sizes that multiply with -tp into the GPUs one server occupies.
++_WORLD_SIZE_ARGS = frozenset({"pipeline-parallel-size", "prefill-context-parallel-size", "data-parallel-size"})
++
+ 
+ @dataclass(frozen=True)
+ class AtomBackend(Backend):
+@@ -90,9 +95,17 @@ class AtomBackend(Backend):
+         return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
+ 
+     def _kv_transfer_config(
+-        self, process: Process, worker_ip: str, extra_connectors: list[dict[str, Any]]
++        self,
++        process: Process,
++        worker_ip: str,
++        extra_connectors: list[dict[str, Any]],
++        mooncake_config: dict[str, Any],
+     ) -> str | None:
+-        """Mooncake for P/D workers plus the role's extra connectors; several are wrapped in ``multi``."""
++        """Mooncake for P/D workers plus the role's extra connectors; several are wrapped in ``multi``.
++
++        ``mooncake_config`` (the role's ``mooncake-connector-config``) adds ATOM connector
++        keys such as ``num_worker_threads`` to the Mooncake entry; srtctl's own keys stay its.
++        """
+         connectors = []
+         for connector in extra_connectors:
+             if connector.get("kv_connector") == "lmcache_mp":
+@@ -111,7 +124,14 @@ class AtomBackend(Backend):
+             }
+             if self.mooncake_protocol is not None:
+                 mooncake["protocol"] = self.mooncake_protocol
+-            connectors.insert(0, mooncake)
++            if not isinstance(mooncake_config, dict):
++                raise ValueError("mooncake-connector-config must be a mapping of ATOM Mooncake connector keys")
++            overlap = sorted(mooncake.keys() & mooncake_config.keys())
++            if overlap:
++                raise ValueError(f"mooncake-connector-config cannot override srtctl-managed key(s): {overlap}")
++            connectors.insert(0, {**mooncake, **mooncake_config})
++        elif mooncake_config:
++            raise ValueError("mooncake-connector-config applies to prefill and decode roles only")
+         if not connectors:
+             return None
+         payload = connectors[0] if len(connectors) == 1 else {"kv_connector": "multi", "connectors": connectors}
+@@ -127,8 +147,11 @@ class AtomBackend(Backend):
+         dump_config_path: Path | None = None,
+         profiling: ProfilingConfig | None = None,
+     ) -> list[str]:
+-        if frontend_type != "atomesh":
+-            raise ValueError(f"backend.type: atom requires frontend.type: atomesh (got {frontend_type!r})")
++        from srtctl.frontends import get_frontend
++
++        frontend = get_frontend(frontend_type)
++        if frontend.required_backend != self.type:
++            raise ValueError(f"backend.type: atom requires an ATOM frontend such as atomesh (got {frontend_type!r})")
+         if len({item.node for item in endpoint_processes}) != 1:
+             raise ValueError("ATOM currently requires each logical endpoint to fit on one Slurm node")
+ 
+@@ -137,17 +160,17 @@ class AtomBackend(Backend):
+         worker_ip = get_hostname_ip(process.node, runtime.network_interface)
+         config = self.get_config_for_mode(process.endpoint_mode)
+         extra_connectors = config.pop("extra-kv-connectors", [])
+-        reserved = {"model", "host", "server-port", "tp", "tensor-parallel-size", "kv-transfer-config"}
+-        overlap = reserved.intersection(_canonical_arg_key(key) for key in config)
++        mooncake_config = config.pop("mooncake-connector-config", {})
++        overlap = MANAGED_ARGS.intersection(_canonical_arg_key(key) for key in config)
+         if overlap:
+             raise ValueError(f"ATOM config cannot override srtctl-managed argument(s): {sorted(overlap)}")
+ 
+         command = ["env", f"ATOM_HOST_IP={worker_ip}", *(nsys_prefix or [])]
++        command.extend(
++            frontend.worker_entrypoint(process, runtime) or ["python3", "-m", "atom.entrypoints.openai_server"]
++        )
+         command.extend(
+             [
+-                "python3",
+-                "-m",
+-                "atom.entrypoints.openai_server",
+                 "--model",
+                 runtime.worker_model_arg,
+                 "--host",
+@@ -155,10 +178,10 @@ class AtomBackend(Backend):
+                 "--server-port",
+                 str(process.http_port),
+                 "-tp",
+-                str(len(process.gpu_indices)),
++                str(_tensor_parallel_size(config, len(process.gpu_indices))),
+             ]
+         )
+-        kv_transfer_config = self._kv_transfer_config(process, worker_ip, extra_connectors)
++        kv_transfer_config = self._kv_transfer_config(process, worker_ip, extra_connectors, mooncake_config)
+         if kv_transfer_config is not None:
+             command.extend(["--kv-transfer-config", kv_transfer_config])
+         command.extend(_config_to_cli_args(config))
+@@ -183,3 +206,21 @@ def _config_to_cli_args(config: dict[str, Any]) -> list[str]:
+ 
+ def _canonical_arg_key(key: str) -> str:
+     return key.lstrip("-").replace("_", "-")
++
++
++def _tensor_parallel_size(config: dict[str, Any], gpus: int) -> int:
++    """The -tp that fills the worker's GPUs once the role's other parallel sizes are taken out.
++
++    ATOM runs dp x pp engines of tp x pcp GPUs each. Decode context parallelism
++    reuses the TP GPUs and DP-attention turns -tp into DP ranks, so neither enters.
++    """
++    others = 1
++    for key, value in config.items():
++        name = _canonical_arg_key(key)
++        if name in _WORLD_SIZE_ARGS:
++            others *= int(value)
++        elif any(arg.startswith(name) for arg in _WORLD_SIZE_ARGS):
++            raise ValueError(f"ATOM config key {key!r} abbreviates a parallel size; spell it out")
++    if others < 1 or gpus % others:
++        raise ValueError(f"ATOM worker has {gpus} GPU(s), not a multiple of its pp x pcp x dp = {others}")
++    return gpus // others
+diff --git a/src/srtctl/frontends/__init__.py b/src/srtctl/frontends/__init__.py
+index 611e15b..28dab97 100644
+--- a/src/srtctl/frontends/__init__.py
++++ b/src/srtctl/frontends/__init__.py
+@@ -10,6 +10,7 @@ importing it from here is what makes ``frontend.type: <type>`` resolvable.
+ 
+ Supported frontend types:
+ - dynamo: Dynamo frontend with NATS/etcd communication
++- infera: Infera router in front of ATOM workers that register over etcd
+ - llm-d: llm-d Endpoint Picker behind Envoy, with the P/D sidecar on decode workers
+ - sglang: Direct sglang.launch_server for a single aggregate worker (no router)
+ - sglang-router: SGLang Model Gateway router in front of static workers
+@@ -30,6 +31,7 @@ from srtctl.frontends.base import (
+ )
+ from srtctl.frontends.dynamic_frontend import DynamicFrontend
+ from srtctl.frontends.dynamo import DynamoFrontend
++from srtctl.frontends.infera import InferaFrontend
+ from srtctl.frontends.llm_d import LLMDFrontend
+ from srtctl.frontends.sglang import SGLangRouterFrontend
+ from srtctl.frontends.sglang_direct import SGLangFrontend
+@@ -45,6 +47,7 @@ __all__ = [
+     "DynamicFrontend",
+     "DynamoFrontend",
+     "Frontend",
++    "InferaFrontend",
+     "LLMDFrontend",
+     "SGLangFrontend",
+     "SGLangRouterFrontend",
+diff --git a/src/srtctl/frontends/base.py b/src/srtctl/frontends/base.py
+index c552fbe..58bff63 100644
+--- a/src/srtctl/frontends/base.py
++++ b/src/srtctl/frontends/base.py
+@@ -39,7 +39,7 @@ class Frontend(ABC):
+     1. Which backend it pairs with and what its recipe rules are
+        (``required_backend``, ``validate``)
+     2. How its workers are launched and which port each binds
+-       (``worker_launch``, ``worker_api_port``, ``expands_node_local_dp``)
++       (``worker_launch``, ``worker_entrypoint``, ``worker_api_port``, ``expands_node_local_dp``)
+     3. Which rank serves metrics, an endpoint, or profiler control, and where
+        (``worker_metrics_port``, ``worker_endpoint_port``, ``profiling_control_port``,
+        ``direct_endpoint_nodes``, ``worker_ready_port``, ``metrics_path``)
+@@ -82,6 +82,17 @@ class Frontend(ABC):
+         """Frontend type identifier (e.g., 'dynamo', 'sglang')."""
+         raise NotImplementedError
+ 
++    def worker_entrypoint(self, process: "Process", runtime: "RuntimeContext") -> list[str] | None:
++        """Argv that starts a direct worker in place of the engine's own server module, or ``None`` for that module.
++
++        A frontend whose workers register themselves through a wrapper around the
++        engine's server (Infera's ``python3 -m infera.engine.atom``) returns the
++        wrapper with its registration flags; the backend appends the server's own
++        arguments, which the wrapper forwards. ``worker_launch`` stays ``direct``:
++        the worker is still the engine's own server on its allocated port.
++        """
++        return None
++
+     @abstractmethod
+     def worker_api_port(self, mode: str) -> Literal["public", "allocated"]:
+         """Which port a direct worker of ``mode`` binds.
+diff --git a/src/srtctl/frontends/dynamic_frontend.py b/src/srtctl/frontends/dynamic_frontend.py
+index 22e749f..61df59b 100644
+--- a/src/srtctl/frontends/dynamic_frontend.py
++++ b/src/srtctl/frontends/dynamic_frontend.py
+@@ -8,38 +8,32 @@ A static router is launched with its worker URLs on the command line; a
+ dynamic frontend is launched with no worker list, workers announce
+ themselves over a discovery plane (Dynamo: etcd and NATS), and readiness is
+ the frontend's own registration count checked against the allocated
+-topology. Consequences shared by every such frontend live here: it fronts
+-any engine, it needs no per-worker URL gate before traffic, and no worker is
+-itself the public endpoint.
++topology. Consequences shared by every such frontend live here: it needs no
++per-worker URL gate before traffic, and no worker is itself the public
++endpoint.
+ 
+ A router binary that can also take static URLs (vLLM Router's ZMQ discovery
+ mode) is a mode of a static router, not a dynamic frontend.
+ 
+-Dynamo is the only implementation today. A subclass sets ``type`` and
+-``worker_launch``, registers with ``@register_frontend``, parses its own
+-registration count in ``parse_health``, decides which rank serves which port,
+-and launches the process in ``start_frontends``.
++Dynamo and Infera implement it. A subclass sets ``type`` (and
++``worker_launch`` when its workers are not the engine's own server), registers
++with ``@register_frontend``, parses its own registration count in
++``parse_health``, decides which rank serves which port, and launches the
++process in ``start_frontends``.
+ """
+ 
+ from __future__ import annotations
+ 
+ from abc import abstractmethod
+-from typing import TYPE_CHECKING, Any, Literal
++from typing import Any, Literal
+ 
+ from srtctl.core.health import WorkerHealthResult, probe_json_health
+ from srtctl.frontends.base import Frontend, frontend_args_to_cli
+ 
+-if TYPE_CHECKING:
+-    from srtctl.backends.base import WorkerMode
+-
+ 
+ class DynamicFrontend(Frontend):
+     """Base class for frontends that discover their workers through registration."""
+ 
+-    def worker_metrics_path(self, backend: Any, mode: WorkerMode) -> str | None:
+-        """Every rank's Dynamo system server answers ``/metrics``, whatever the engine."""
+-        return self.metrics_path
+-
+     @property
+     def health_endpoint(self) -> str:
+         """The frontend reports its registered workers here; ``parse_health`` counts them."""
+diff --git a/src/srtctl/frontends/dynamo.py b/src/srtctl/frontends/dynamo.py
+index d574f3c..86de69d 100644
+--- a/src/srtctl/frontends/dynamo.py
++++ b/src/srtctl/frontends/dynamo.py
+@@ -108,6 +108,10 @@ class DynamoFrontend(DynamicFrontend):
+     # dynamo.<engine> workers register over the request plane; they bind no OpenAI port.
+     worker_launch: ClassVar[Literal["dynamo", "direct"]] = "dynamo"
+ 
++    def worker_metrics_path(self, backend: Any, mode: "WorkerMode") -> str | None:
++        """Every rank's Dynamo system server answers ``/metrics``, whatever the engine."""
++        return self.metrics_path
++
+     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
+         """Every rank runs the Dynamo system status server (health, metrics) on its system port."""
+         return process.sys_port if process.sys_port > 0 else None
+diff --git a/src/srtctl/frontends/infera.py b/src/srtctl/frontends/infera.py
+new file mode 100644
+index 0000000..20bb9a8
+--- /dev/null
++++ b/src/srtctl/frontends/infera.py
+@@ -0,0 +1,236 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-FileCopyrightText: Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Infera router frontend (`frontend.type: infera`) for native ATOM workers.
++
++Infera (https://github.com/AMD-AGI/Infera) runs each worker through
++``python3 -m infera.engine.atom``, which starts ATOM's own OpenAI server and then
++registers it in etcd; the router (``python3 -m infera.server``) watches etcd and
++lists what it routes to at ``GET /v1/workers``. Workers are therefore the engine's
++own servers on their allocated ports, discovered rather than passed on the
++router's command line.
++"""
++
++from __future__ import annotations
++
++import logging
++import shlex
++import threading
++from collections.abc import Collection
++from typing import TYPE_CHECKING, Any, ClassVar
++
++from srtctl.backends.atom import MANAGED_ARGS
++from srtctl.core.health import WorkerHealthResult
++from srtctl.core.slurm import get_hostname_ip, start_srun_process
++from srtctl.frontends.base import numactl_prefix, register_frontend
++from srtctl.frontends.dynamic_frontend import DynamicFrontend
++from srtctl.frontends.static_router import setup_script_preamble
++from srtctl.ports import ETCD_CLIENT_PORT
++from srtctl.services.config import ServiceConfig
++from srtctl.services.implicit import ETCD_SERVICE_NAME, EffectiveService, find_service, infra_placement
++
++if TYPE_CHECKING:
++    from srtctl.core.processes import ManagedProcess
++    from srtctl.core.runtime import RuntimeContext
++    from srtctl.core.topology import Process
++
++logger = logging.getLogger(__name__)
++
++# Router flags derived from the allocation; a recipe value would point the router elsewhere.
++MANAGED_ROUTER_ARGS = frozenset(
++    {"host", "port", "discovery-backend", "etcd-endpoint", "router-tokenizer-path", "request-transport"}
++)
++# Worker launcher flags srtctl sets in ``worker_entrypoint``.
++MANAGED_LAUNCHER_ARGS = frozenset({"etcd-endpoint", "advertise-host"})
++
++
++def etcd_endpoint(runtime: RuntimeContext) -> str:
++    """The implied etcd service on the infra node, as workers and router dial it."""
++    return f"http://{runtime.infra_node_ip}:{ETCD_CLIENT_PORT}"
++
++
++def _flag(key: Any) -> str:
++    return str(key).lstrip("-").replace("_", "-")
++
++
++def _reaches(key: str, flags: Collection[str]) -> bool:
++    """Whether ``--key`` names one of ``flags``, in full or as an argparse prefix."""
++    return any(flag.startswith(key) for flag in flags)
++
++
++@register_frontend("infera")
++class InferaFrontend(DynamicFrontend):
++    """Infera's router in front of ATOM servers that register themselves over etcd."""
++
++    type: ClassVar[str] = "infera"
++    required_backend: ClassVar[str | None] = "atom"
++
++    @property
++    def health_endpoint(self) -> str:
++        """Infera's ``/health`` answers 200 with no worker breakdown; ``/v1/workers`` lists each registration."""
++        return "/v1/workers"
++
++    def worker_entrypoint(self, process: Process, runtime: RuntimeContext) -> list[str] | None:
++        """``infera.engine.atom`` registers the server it starts; its readiness listener is the allocated sys port."""
++        return [
++            "env",
++            f"INFERA_READINESS_PORT={process.sys_port}",
++            "python3",
++            "-m",
++            "infera.engine.atom",
++            "--etcd-endpoint",
++            etcd_endpoint(runtime),
++            "--advertise-host",
++            get_hostname_ip(process.node, runtime.network_interface),
++        ]
++
++    # A worker is ATOM's own OpenAI server: metrics, endpoint and profiler routes live on its HTTP port.
++    def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
++        return process.http_port if process.is_leader and process.http_port > 0 else None
++
++    def worker_endpoint_port(self, process: Process, config: Any, runtime: RuntimeContext) -> int | None:
++        return process.http_port if process.is_leader and process.http_port > 0 else None
++
++    def profiling_control_port(self, process: Process, config: Any, runtime: RuntimeContext) -> int | None:
++        return process.http_port if process.http_port > 0 else None
++
++    def worker_ready_port(self, process: Process) -> int:
++        """INFERA_READINESS_PORT: open once the worker is registered (see ``worker_entrypoint``)."""
++        return process.sys_port
++
++    def implied_services(self, config: Any) -> list[EffectiveService]:
++        """Workers register in etcd; the router watches it."""
++        return [
++            EffectiveService(
++                ServiceConfig(name=ETCD_SERVICE_NAME, type="etcd", placement=infra_placement(config)),
++                implicit=True,
++                reason="frontend.type infera",
++            )
++        ]
++
++    def validate(self, config: Any) -> None:
++        """Keep srtctl's router and worker flags authoritative and the job free of NATS.
++
++        ATOM's server and Infera's router accept an unambiguous prefix of a flag, so
++        a prefix of a managed flag counts as that flag. Infera's worker launcher reads
++        ``-tp`` and ``--kv-transfer-config`` with prefixes disabled, so a prefix would
++        reach ATOM but not the registration the launcher writes.
++        """
++        args = {_flag(key): value for key, value in (config.frontend.args or {}).items()}
++        managed = sorted(key for key in args if _reaches(key, MANAGED_ROUTER_ARGS))
++        if managed:
++            raise ValueError(f"frontend.args {managed} are managed by srtctl for frontend.type: infera")
++        if any(_reaches(key, ("kv-event-transport",)) and value == "nats" for key, value in args.items()):
++            raise ValueError("frontend.type: infera runs no NATS server; use kv-event-transport: zmq")
++        rust = any(_reaches(key, ("router-backend",)) and value == "rust" for key, value in args.items())
++        if rust and config.topology.is_disaggregated:
++            raise ValueError(
++                "frontend.type: infera prefill/decode needs router-backend: python; "
++                "Infera's Rust router does not implement ATOM's Mooncake hand-off"
++            )
++        etcd = find_service(config, ETCD_SERVICE_NAME)
++        if etcd is not None and etcd.external:
++            raise ValueError(
++                "frontend.type: infera workers register in the job's own etcd; drop services[etcd].external"
++            )
++
++        for mode in ("prefill", "decode", "agg"):
++            keys = [_flag(key) for key in config.backend_for_role(mode).get_config_for_mode(mode)]
++            managed = sorted(key for key in keys if _reaches(key, MANAGED_ARGS | MANAGED_LAUNCHER_ARGS))
++            if managed:
++                raise ValueError(f"roles.{mode}.args {managed} are managed by srtctl for frontend.type: infera")
++            if "enable-kv-events" in keys:
++                raise ValueError(
++                    f"roles.{mode}.args.enable-kv-events is not supported with frontend.type: infera: "
++                    "the KV-event publisher binds a port srtctl does not allocate"
++                )
++            if any(_reaches(key, ("served-model-name",)) for key in keys):
++                raise ValueError(
++                    f"roles.{mode}.args.served-model-name is not supported with frontend.type: infera: "
++                    "Infera registers each worker under its --model, which clients must send"
++                )
++
++    def parse_health(self, response_json: dict, expected_prefill: int, expected_decode: int) -> WorkerHealthResult:
++        """Count active registrations; an aggregate worker registers as ``mixed`` and counts as decode."""
++        workers = response_json.get("workers")
++        if not isinstance(workers, list):
++            return WorkerHealthResult(ready=False, message=f"Key 'workers' not found in response: {response_json}")
++        active = [w for w in workers if isinstance(w, dict) and w.get("status") == "active"]
++        prefill = sum(w.get("disagg_mode") == "prefill" for w in active)
++        decode = sum(w.get("disagg_mode") in ("decode", "mixed") for w in active)
++        ready = prefill >= expected_prefill and decode >= expected_decode
++        state = "ready" if ready else f"waiting for {expected_prefill}P + {expected_decode}D"
++        return WorkerHealthResult(
++            ready=ready,
++            message=f"Infera {state}: {prefill} prefill and {decode} decode/mixed workers active",
++            prefill_ready=prefill,
++            prefill_expected=expected_prefill,
++            decode_ready=decode,
++            decode_expected=expected_decode,
++        )
++
++    def start_process(self, **kwargs: Any) -> Any:
++        """Launch one router process; split out for adapter-specific tests."""
++        return start_srun_process(**kwargs)
++
++    def start_frontends(
++        self,
++        topology: Any,
++        runtime: RuntimeContext,
++        config: Any,
++        backend: Any,
++        backend_processes: list[Process],
++        stop_event: threading.Event | None = None,
++    ) -> list[ManagedProcess]:
++        from srtctl.core.processes import FRONTEND_TERMINATE_TIMEOUT_SECONDS, ManagedProcess
++
++        processes: list[ManagedProcess] = []
++        for idx, node in enumerate(topology.frontend_nodes):
++            # ATOM workers serve HTTP only, so requests go over HTTP and no NATS is needed.
++            cmd = [
++                "python3",
++                "-m",
++                "infera.server",
++                "--host",
++                "0.0.0.0",
++                "--port",
++                str(topology.frontend_port),
++                "--discovery-backend",
++                "etcd",
++                "--etcd-endpoint",
++                etcd_endpoint(runtime),
++                "--request-transport",
++                "http",
++                "--router-tokenizer-path",
++                runtime.worker_model_arg,
++                *self.get_frontend_args_list(config.frontend.args),
++            ]
++            cmd = numactl_prefix(config) + cmd
++            logger.info("Starting infera router %d on %s: %s", idx, node, shlex.join(cmd))
++            log = runtime.log_dir / f"{node}_infera_{idx}.out"
++            step_name = f"infera_{idx}"
++            proc = self.start_process(
++                command=cmd,
++                nodelist=[node],
++                output=str(log),
++                container_image=config.frontend.container_image or str(runtime.container_image),
++                container_mounts=runtime.container_mounts,
++                env_to_set={**runtime.environment, **(config.frontend.env or {})} or None,
++                bash_preamble=setup_script_preamble(config),
++                het_group=runtime.nodes.het_group_for(node),
++                step_name=step_name,
++                srun_options=runtime.srun_options,
++            )
++            processes.append(
++                ManagedProcess(
++                    name=step_name,
++                    popen=proc,
++                    log_file=log,
++                    node=node,
++                    critical=True,
++                    terminate_timeout=FRONTEND_TERMINATE_TIMEOUT_SECONDS,
++                    step_name=step_name,
++                )
++            )
++        return processes
+diff --git a/src/srtctl/mock.py b/src/srtctl/mock.py
+index 5033e73..6b64d67 100644
+--- a/src/srtctl/mock.py
++++ b/src/srtctl/mock.py
+@@ -274,6 +274,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
+         ("srtctl.cli.mixins.postprocess_stage.start_srun_process", _fake_srun),
+         ("srtctl.cli.mixins.service_stage.start_srun_process", _fake_srun),
+         ("srtctl.frontends.dynamo.start_srun_process", _fake_srun),
++        ("srtctl.frontends.infera.start_srun_process", _fake_srun),
+         ("srtctl.frontends.sglang.start_srun_process", _fake_srun),
+         ("srtctl.frontends.static_router.start_srun_process", _fake_srun),
+         ("srtctl.frontends.trtllm_serve.start_srun_process", _fake_srun),
+@@ -286,6 +287,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
+         ("srtctl.cli.mixins.frontend_stage.get_hostname_ip", _fake_hostname_ip),
+         ("srtctl.cli.mixins.benchmark_stage.get_hostname_ip", _fake_hostname_ip),
+         ("srtctl.cli.mixins.service_stage.get_hostname_ip", _fake_hostname_ip),
++        ("srtctl.frontends.infera.get_hostname_ip", _fake_hostname_ip),
+         ("srtctl.frontends.sglang.get_hostname_ip", _fake_hostname_ip),
+         ("srtctl.frontends.static_router.get_hostname_ip", _fake_hostname_ip),
+         ("srtctl.frontends.trtllm_serve.get_hostname_ip", _fake_hostname_ip),
+diff --git a/tests/test_atom_atomesh.py b/tests/test_atom_atomesh.py
+index 2674f54..d4967fa 100644
+--- a/tests/test_atom_atomesh.py
++++ b/tests/test_atom_atomesh.py
+@@ -66,10 +66,10 @@ def test_atomesh_frontend_requires_atom_backend() -> None:
+         _load(data)
+ 
+ 
+-def test_atom_worker_requires_atomesh_frontend() -> None:
++def test_atom_worker_requires_a_frontend_paired_with_atom() -> None:
+     process = Process("node0", frozenset(range(8)), 7500, 6100, "agg", 0)
+ 
+-    with pytest.raises(ValueError, match="requires frontend.type: atomesh"):
++    with pytest.raises(ValueError, match="requires an ATOM frontend"):
+         AtomBackend().build_worker_command(process, [process], _runtime(), frontend_type="dynamo")
+ 
+ 
+@@ -263,6 +263,78 @@ def test_atom_lmcache_mp_defaults_to_the_lmcache_server_port(extra_config: dict,
+     assert json.loads(command[command.index("--kv-transfer-config") + 1])["kv_connector_extra_config"] == expected
+ 
+ 
++@pytest.mark.parametrize(
++    ("gpus", "args", "tp"),
++    [
++        (8, {"data-parallel-size": 1, "enable-dp-attention": True}, "8"),
++        (8, {"decode-context-parallel-size": 8}, "8"),
++        (4, {"pipeline-parallel-size": 4}, "1"),
++        (8, {"pipeline_parallel_size": 2}, "4"),
++        (8, {"prefill-context-parallel-size": 2}, "4"),
++        (8, {"data-parallel-size": 2}, "4"),
++    ],
++)
++def test_atom_tensor_parallel_size_is_what_the_other_parallel_sizes_leave(gpus: int, args: dict, tp: str) -> None:
++    """ATOM runs dp x pp engines of tp x pcp GPUs; DCP and DP-attention reuse the TP GPUs."""
++    backend = AtomBackend(roles={"agg": RoleConfig(args=args)})
++    process = Process("node0", frozenset(range(gpus)), 7500, 6100, "agg", 0)
++
++    command = _build(backend, process)
++
++    assert command[command.index("-tp") + 1] == tp
++
++
++def test_atom_rejects_parallel_sizes_that_do_not_divide_the_worker_gpus() -> None:
++    backend = AtomBackend(roles={"agg": RoleConfig(args={"pipeline-parallel-size": 3})})
++    process = Process("node0", frozenset(range(4)), 7500, 6100, "agg", 0)
++
++    with pytest.raises(ValueError, match=r"4 GPU\(s\), not a multiple of its pp x pcp x dp = 3"):
++        _build(backend, process)
++
++
++def test_atom_rejects_an_abbreviated_parallel_size() -> None:
++    backend = AtomBackend(roles={"agg": RoleConfig(args={"pipeline-parallel": 4})})
++    process = Process("node0", frozenset(range(4)), 7500, 6100, "agg", 0)
++
++    with pytest.raises(ValueError, match="'pipeline-parallel' abbreviates a parallel size"):
++        _build(backend, process)
++
++
++def test_atom_mooncake_connector_config_joins_the_mooncake_entry() -> None:
++    """The role's Mooncake keys reach ATOM inside srtctl's connector, not as a CLI flag."""
++    config = {"mooncake-connector-config": {"num_worker_threads": 4}}
++    backend = AtomBackend(roles={"decode": RoleConfig(args=config)})
++    process = Process("node0", frozenset(range(4)), 7500, 6100, "decode", 0, nixl_port=6301)
++
++    command = _build(backend, process)
++
++    assert json.loads(command[command.index("--kv-transfer-config") + 1]) == {
++        "kv_role": "kv_consumer",
++        "kv_connector": "mooncake",
++        "proxy_ip": WORKER_IP,
++        "handshake_port": 6301,
++        "num_worker_threads": 4,
++    }
++    assert "--mooncake-connector-config" not in command
++
++
++@pytest.mark.parametrize(
++    ("mode", "config", "message"),
++    [
++        ("prefill", {"handshake_port": 1}, r"cannot override srtctl-managed key\(s\): \['handshake_port'\]"),
++        ("agg", {"num_worker_threads": 4}, "applies to prefill and decode roles only"),
++    ],
++)
++def test_atom_mooncake_connector_config_rejects_managed_keys_and_aggregate_roles(
++    mode: str, config: dict, message: str
++) -> None:
++    backend = AtomBackend(roles={mode: RoleConfig(args={"mooncake-connector-config": config})})
++    process = Process("node0", frozenset(range(4)), 7500, 6100, mode, 0, nixl_port=6301)
++
++    with pytest.raises(ValueError, match=message):
++        _build(backend, process)
++
++
+ def test_atom_rejects_cross_node_model_parallel_endpoint() -> None:
+     """ATOM cannot coordinate one logical worker across two Slurm nodes."""
+     leader = Process("node0", frozenset(range(4)), 7500, 6100, "prefill", 0, nixl_port=6301)
+diff --git a/tests/test_design_rules.py b/tests/test_design_rules.py
+index dbcc2fb..91e02a5 100644
+--- a/tests/test_design_rules.py
++++ b/tests/test_design_rules.py
+@@ -132,7 +132,6 @@ RULES = [
+         "get_frontend(config.frontend.type) instead of comparing the name outside src/srtctl/frontends/.",
+         frozenset(
+             {
+-                ("backends/atom.py", "frontend.type vs 'atomesh'"),
+                 ("benchmarks/router.py", "frontend.type vs 'sglang-router'"),
+                 ("cli/mixins/benchmark_stage.py", "frontend.type vs 'sglang-router'"),
+                 ("cli/mixins/frontend_stage.py", "frontend.type vs 'dynamo'"),
+diff --git a/tests/test_frontends.py b/tests/test_frontends.py
+index 403f076..5af7113 100644
+--- a/tests/test_frontends.py
++++ b/tests/test_frontends.py
+@@ -69,6 +69,7 @@ class TestFrontendRegistry:
+         assert list_frontend_types() == [
+             "atomesh",
+             "dynamo",
++            "infera",
+             "llm-d",
+             "none",
+             "sglang",
+@@ -223,7 +224,7 @@ class TestFrontendRegistry:
+         from srtctl.core.schema import FrontendConfig, ResourceConfig, RoleConfig, SrtConfig
+ 
+         with pytest.raises(
+-            ValidationError, match="Unknown frontend.type 'toy-router'.*Available: atomesh, dynamo, llm-d, none"
++            ValidationError, match="Unknown frontend.type 'toy-router'.*Available: atomesh, dynamo, infera, llm-d, none"
+         ):
+             SrtConfig(
+                 name="toy",
+diff --git a/tests/test_infera_frontend.py b/tests/test_infera_frontend.py
+new file mode 100644
+index 0000000..8c6f58d
+--- /dev/null
++++ b/tests/test_infera_frontend.py
+@@ -0,0 +1,294 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-FileCopyrightText: Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Infera router frontend (`frontend.type: infera`) over native ATOM workers."""
++
++import json
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++from marshmallow import ValidationError
++
++from srtctl.backends import AtomBackend
++from srtctl.core.config import resolve_config_with_defaults
++from srtctl.core.schema import RoleConfig, SrtConfig
++from srtctl.core.topology import Process
++from srtctl.frontends import InferaFrontend, get_frontend
++from srtctl.services.implicit import effective_services
++
++WORKER_IP = "10.0.0.20"
++AGG = {"agg": {"nodes": 1, "workers": 1, "gpus": 4}}
++PD = {
++    "prefill": {"nodes": 1, "workers": 1, "gpus": 4, "args": {"pipeline-parallel-size": 4}},
++    "decode": {"nodes": "colocate", "workers": 1, "gpus": 4, "args": {"decode-context-parallel-size": 4}},
++}
++
++
++def _recipe(roles: dict, args: dict | None = None, **extra) -> dict:
++    return {
++        "schema": 2,
++        "engine": "atom",
++        "name": "infera",
++        "model": {"path": "hf:Qwen/Qwen3-0.6B", "container": "infera-atom:latest", "precision": "bf16"},
++        "resources": {"gpu_type": "mi355x", "gpus_per_node": 8},
++        "roles": roles,
++        "frontend": {"type": "infera", "enable_multiple_frontends": False, "args": args or {}},
++        **extra,
++    }
++
++
++def _load(data: dict) -> SrtConfig:
++    return SrtConfig.Schema().load(resolve_config_with_defaults(data, None))
++
++
++def _runtime() -> SimpleNamespace:
++    return SimpleNamespace(worker_model_arg="/model", network_interface="eno0", infra_node_ip="10.0.0.1")
++
++
++def _build(backend: AtomBackend, process: Process) -> list[str]:
++    with (
++        patch("srtctl.core.slurm.get_hostname_ip", return_value=WORKER_IP),
++        patch("srtctl.frontends.infera.get_hostname_ip", return_value=WORKER_IP),
++    ):
++        return backend.build_worker_command(process, [process], _runtime(), frontend_type="infera")
++
++
++def test_registry_resolves_infera_for_atom() -> None:
++    frontend = get_frontend("infera")
++    assert isinstance(frontend, InferaFrontend)
++    assert frontend.required_backend == "atom"
++    assert frontend.worker_launch == "direct"
++    assert frontend.worker_api_port("agg") == "allocated"
++
++
++def test_infera_requires_atom_backend() -> None:
++    data = _recipe(AGG)
++    data["engine"] = "sglang"
++    with pytest.raises(ValidationError, match="frontend.type: infera requires backend.type: atom"):
++        _load(data)
++
++
++def test_infera_implies_etcd_on_the_infra_node_and_no_nats() -> None:
++    services = effective_services(_load(_recipe(AGG)))
++    etcd = [entry for entry in services if entry.service.type == "etcd"]
++    assert len(etcd) == 1 and etcd[0].implicit and etcd[0].reason == "frontend.type infera"
++    assert not [entry for entry in services if entry.service.type == "nats"]
++
++
++def test_aggregate_worker_runs_atom_under_the_infera_launcher() -> None:
++    backend = AtomBackend(roles={"agg": RoleConfig(args={"enable-dp-attention": True})})
++    process = Process("node0", frozenset(range(4)), 7500, 6100, "agg", 0, nixl_port=5400)
++
++    assert _build(backend, process) == [
++        "env",
++        f"ATOM_HOST_IP={WORKER_IP}",
++        "env",
++        "INFERA_READINESS_PORT=7500",
++        "python3",
++        "-m",
++        "infera.engine.atom",
++        "--etcd-endpoint",
++        "http://10.0.0.1:2379",
++        "--advertise-host",
++        WORKER_IP,
++        "--model",
++        "/model",
++        "--host",
++        "0.0.0.0",
++        "--server-port",
++        "6100",
++        "-tp",
++        "4",
++        "--enable-dp-attention",
++    ]
++
++
++def test_pipeline_parallel_prefill_registers_as_a_mooncake_producer() -> None:
++    """TP1 x PP4 on four GPUs with four Mooncake send workers, next to an offload connector."""
++    args = {
++        "pipeline-parallel-size": 4,
++        "mooncake-connector-config": {"num_worker_threads": 4},
++        "extra-kv-connectors": [{"kv_connector": "lmcache_offload", "kv_role": "offload"}],
++    }
++    backend = AtomBackend(roles={"prefill": RoleConfig(args=args)}, mooncake_protocol="rdma")
++    process = Process("node0", frozenset(range(4)), 7500, 6100, "prefill", 0, nixl_port=5400)
++
++    command = _build(backend, process)
++
++    assert command[command.index("-tp") + 1] == "1"
++    assert command[command.index("--pipeline-parallel-size") + 1] == "4"
++    assert json.loads(command[command.index("--kv-transfer-config") + 1]) == {
++        "kv_connector": "multi",
++        "connectors": [
++            {
++                "kv_role": "kv_producer",
++                "kv_connector": "mooncake",
++                "proxy_ip": WORKER_IP,
++                "handshake_port": 5400,
++                "protocol": "rdma",
++                "num_worker_threads": 4,
++            },
++            {"kv_connector": "lmcache_offload", "kv_role": "offload"},
++        ],
++    }
++
++
++def test_colocated_prefill_and_decode_get_their_own_readiness_ports() -> None:
++    config = _load(_recipe(PD))
++    prefill, decode = config.backend.endpoints_to_processes(
++        config.allocate_worker_endpoints(["node0"]), frontend_type="infera"
++    )
++
++    assert (sorted(prefill.gpu_indices), sorted(decode.gpu_indices)) == ([0, 1, 2, 3], [4, 5, 6, 7])
++    assert "INFERA_READINESS_PORT=7500" in _build(config.backend, prefill)
++    assert "INFERA_READINESS_PORT=7501" in _build(config.backend, decode)
++
++
++def test_worker_ports_are_atoms_own_server_and_the_readiness_listener() -> None:
++    frontend = InferaFrontend()
++    leader = Process("node0", frozenset(range(4)), 7500, 6100, "prefill", 0)
++
++    assert frontend.worker_metrics_port(leader, _runtime()) == 6100
++    assert frontend.worker_endpoint_port(leader, None, _runtime()) == 6100
++    assert frontend.worker_metrics_path(AtomBackend(), "prefill") == "/metrics"
++    assert frontend.worker_ready_port(leader) == 7500
++
++
++@pytest.mark.parametrize(
++    ("roles", "args", "extra", "message"),
++    [
++        (AGG, {"port": 9000}, {}, r"frontend.args \['port'\] are managed by srtctl"),
++        (AGG, {"etcd_endpoint": "http://x:2379"}, {}, r"frontend.args \['etcd-endpoint'\] are managed"),
++        (AGG, {"request-trans": "nats"}, {}, r"frontend.args \['request-trans'\] are managed"),
++        (AGG, {"kv-event-transport": "nats"}, {}, "runs no NATS server"),
++        (PD, {"router-backend": "rust"}, {}, "prefill/decode needs router-backend: python"),
++        (
++            AGG,
++            {},
++            {"services": [{"name": "etcd", "type": "etcd", "external": "http://etcd.shared:2379"}]},
++            r"drop services\[etcd\].external",
++        ),
++    ],
++)
++def test_validate_rejects_router_settings_srtctl_cannot_honor(
++    roles: dict, args: dict, extra: dict, message: str
++) -> None:
++    with pytest.raises(ValidationError, match=message):
++        _load(_recipe(roles, args, **extra))
++
++
++@pytest.mark.parametrize(
++    ("key", "managed"),
++    [
++        ("tensor-parallel", "tensor-parallel"),
++        ("kv_transfer_conf", "kv-transfer-conf"),
++        ("advertise-host", "advertise-host"),
++        ("--etcd-endpoint", "etcd-endpoint"),
++    ],
++)
++def test_validate_rejects_worker_args_srtctl_manages_or_their_prefixes(key: str, managed: str) -> None:
++    roles = {"agg": {**AGG["agg"], "args": {key: "x"}}}
++    with pytest.raises(ValidationError, match=rf"roles.agg.args \['{managed}'\] are managed by srtctl"):
++        _load(_recipe(roles))
++
++
++def test_validate_rejects_kv_events_on_a_worker() -> None:
++    roles = {**PD, "decode": {**PD["decode"], "args": {"enable_kv_events": True}}}
++    with pytest.raises(ValidationError, match="roles.decode.args.enable-kv-events is not supported"):
++        _load(_recipe(roles))
++
++
++@pytest.mark.parametrize("key", ["served-model-name", "served_model"])
++def test_validate_rejects_a_served_model_name_the_router_would_not_match(key: str) -> None:
++    roles = {"agg": {**AGG["agg"], "args": {key: "glm"}}}
++    with pytest.raises(ValidationError, match="roles.agg.args.served-model-name is not supported"):
++        _load(_recipe(roles))
++
++
++def test_validate_accepts_the_python_router_policy_flags_and_rust_for_aggregate() -> None:
++    _load(_recipe(PD, {"router-backend": "python", "router-policy": "round-robin", "kv-event-transport": "zmq"}))
++    _load(_recipe(AGG, {"router-backend": "rust"}))
++
++
++@pytest.mark.parametrize(
++    ("workers", "expected", "counted", "ready"),
++    [
++        ([{"disagg_mode": "mixed", "status": "active"}], (0, 1), (0, 1), True),
++        (
++            [{"disagg_mode": "prefill", "status": "active"}, {"disagg_mode": "decode", "status": "active"}],
++            (1, 1),
++            (1, 1),
++            True,
++        ),
++        (
++            [{"disagg_mode": "prefill", "status": "active"}, {"disagg_mode": "decode", "status": "draining"}],
++            (1, 1),
++            (1, 0),
++            False,
++        ),
++        ([], (0, 1), (0, 0), False),
++    ],
++)
++def test_readiness_counts_active_registrations_by_mode(
++    workers: list, expected: tuple[int, int], counted: tuple[int, int], ready: bool
++) -> None:
++    result = InferaFrontend().parse_health({"workers": workers}, *expected)
++    assert result.ready is ready
++    assert (result.prefill_ready, result.decode_ready) == counted
++
++
++def test_readiness_without_a_worker_list_is_not_ready() -> None:
++    assert not InferaFrontend().parse_health({"status": "ok", "active_workers": 2}, 1, 1).ready
++
++
++def test_router_command_watches_etcd_over_http(tmp_path: Path) -> None:
++    topology = SimpleNamespace(frontend_nodes=["node0"], frontend_port=8000)
++    runtime = SimpleNamespace(
++        log_dir=tmp_path,
++        infra_node_ip="10.0.0.1",
++        worker_model_arg="/model",
++        container_image="infera-atom:latest",
++        container_mounts={},
++        environment={"HF_HOME": "/hf"},
++        srun_options={},
++        nodes=SimpleNamespace(het_group_for=lambda node: None),
++    )
++    config = SimpleNamespace(
++        frontend=SimpleNamespace(
++            args={"router-policy": "round-robin", "session-affinity": "prefill"},
++            env={"INFERA_LOG_LEVEL": "info"},
++            container_image=None,
++            numa_bind=False,
++        ),
++        setup_script="install-infera.sh",
++    )
++    with patch.object(InferaFrontend, "start_process", return_value=MagicMock()) as srun:
++        InferaFrontend().start_frontends(topology, runtime, config, AtomBackend(), [])
++
++    kwargs = srun.call_args.kwargs
++    assert kwargs["command"] == [
++        "python3",
++        "-m",
++        "infera.server",
++        "--host",
++        "0.0.0.0",
++        "--port",
++        "8000",
++        "--discovery-backend",
++        "etcd",
++        "--etcd-endpoint",
++        "http://10.0.0.1:2379",
++        "--request-transport",
++        "http",
++        "--router-tokenizer-path",
++        "/model",
++        "--router-policy",
++        "round-robin",
++        "--session-affinity",
++        "prefill",
++    ]
++    assert kwargs["env_to_set"] == {"HF_HOME": "/hf", "INFERA_LOG_LEVEL": "info"}
++    assert "install-infera.sh" in kwargs["bash_preamble"]
