@@ -1488,14 +1488,14 @@ glm5.2-fp4-mi355x-atom-agentic-mtp:
 
 glm5.2-fp4-mi355x-infera-atom-agentic-agg:
   # TODO(M3): pin the released rocm/infera:atom image by digest.
-  image: infera-atom:nightly-202610131505-pr198fix
+  image: infera-atom:atom-router-882fcd0e
   model: amd/GLM-5.2-MXFP4
   model-prefix: glm5.2
   runner: cluster:mi355x-amds
   precision: fp4
   framework: infera-atom
   # TODO(M3): the Infera commit the released image ships.
-  router: { name: infera, version: "fcc00dbeca719451a3e94d0e1cd32d5aa73c055a" }
+  router: { name: infera, version: "5a7cab9faa30ae5d17283d758437520ecbc56260" }
   multinode: true
   disagg: false
   srt-recipe-dir: glm5.2/atom/mi355x-fp4/agentx
@@ -1511,14 +1511,14 @@ glm5.2-fp4-mi355x-infera-atom-agentic-agg:
 
 glm5.2-fp4-mi355x-infera-atom-agentic-disagg:
   # TODO(M3): pin the released rocm/infera:atom image by digest.
-  image: infera-atom:nightly-202610131505-pr198fix
+  image: infera-atom:atom-router-882fcd0e
   model: amd/GLM-5.2-MXFP4
   model-prefix: glm5.2
   runner: cluster:mi355x-amds
   precision: fp4
   framework: infera-atom
   # TODO(M3): the Infera commit the released image ships.
-  router: { name: infera, version: "fcc00dbeca719451a3e94d0e1cd32d5aa73c055a" }
+  router: { name: infera, version: "5a7cab9faa30ae5d17283d758437520ecbc56260" }
   kv-p2p-transfer: mooncake
   multinode: true
   disagg: true
