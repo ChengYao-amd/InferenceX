@@ -118,6 +118,17 @@ override_pp4_dcp4_c32:
         max-num-seqs: 64
         cudagraph-capture-sizes: '[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64]'
 
+override_pp4_dcp4_c40:
+  roles:
+    prefill:
+      args:
+        num-speculative-tokens: 4
+    decode:
+      args:
+        num-speculative-tokens: 4
+        max-num-seqs: 80
+        cudagraph-capture-sizes: '[1,2,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,72,76,80]'
+
 override_pp4_dcp4_c48:
   roles:
     prefill:

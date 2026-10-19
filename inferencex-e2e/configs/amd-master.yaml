@@ -1534,6 +1534,10 @@ glm5.2-fp4-mi355x-infera-atom-agentic-disagg:
           prefill: { num-worker: 1, tp: 1, pp: 4, ep: 1, dp-attn: false },
           decode: { num-worker: 1, tp: 4, dcp-size: 4, ep: 1, dp-attn: false } }
       - { spec-decoding: mtp, kv-offloading: dram, kv-offload-backend: { name: lmcache, version: "0.5.6.dev139+gf22dec28" },
+          conc-list: [40], srt-recipe: disagg-infera-variants.yaml:override_pp4_dcp4_c40,
+          prefill: { num-worker: 1, tp: 1, pp: 4, ep: 1, dp-attn: false },
+          decode: { num-worker: 1, tp: 4, dcp-size: 4, ep: 1, dp-attn: false } }
+      - { spec-decoding: mtp, kv-offloading: dram, kv-offload-backend: { name: lmcache, version: "0.5.6.dev139+gf22dec28" },
           conc-list: [48], srt-recipe: disagg-infera-variants.yaml:override_pp4_dcp4_c48,
           prefill: { num-worker: 1, tp: 1, pp: 4, ep: 1, dp-attn: false },
           decode: { num-worker: 1, tp: 4, dcp-size: 4, ep: 1, dp-attn: false } }
